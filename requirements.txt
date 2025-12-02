@@ -1,2 +1,4 @@
 bleak
 Pillow
+rich
+python-barcode
