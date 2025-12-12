@@ -51,6 +51,7 @@ try:
             break
     else:   # if didn't break
         error('Warning: No languages were found', exception=None)
+        i18n = lambda x, *args: x # Fallback identity function
 except ImportError:
     fatal(
         'Folder "printer_lib" is incomplete or missing, please check.',
