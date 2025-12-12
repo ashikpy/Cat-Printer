@@ -162,8 +162,8 @@ class PrinterServerHandler(BaseHTTPRequestHandler):
     settings = DictAsObject({
         'config_path': 'config.json',
         'version': 4,
-        'first_run': True,
-        'is_android': False,
+        'first_run': True, # Legacy?
+        # 'is_android': False, # Removed
         'scan_time': 4.0,
         'dry_run': False,
         'energy': 64,
@@ -172,7 +172,7 @@ class PrinterServerHandler(BaseHTTPRequestHandler):
     _settings_blacklist = (
         'printer', 'is_android'
     )
-    all_script: list = []
+    # all_script: list = [] # Removed
 
     printer: PrinterDriver = PrinterDriver()
     
@@ -202,8 +202,12 @@ class PrinterServerHandler(BaseHTTPRequestHandler):
         if '/..' in path or '../' in path:
             return
         if path == '/':
-            path += 'index.html'
-        
+             self.send_response(200)
+             self.send_header('Content-Type', 'text/plain;charset=utf-8')
+             self.end_headers()
+             self.wfile.write(b'Cat-Printer Backend is Running.')
+             return
+
         # New API for status
         if path.startswith('/print_status'):
              # Parse query
@@ -225,34 +229,12 @@ class PrinterServerHandler(BaseHTTPRequestHandler):
                  self.send_response(503) # Service unavailable (no processor yet)
                  self.end_headers()
                  return
-
-        # special
-        if path.startswith('/~'):
-            action = path[2:]
-            if action == 'every.js':
-                self.send_response(200)
-                self.send_header('Content-Type', mime(path))
-                self.end_headers()
-                for data in concat_files(*(self.all_script), prefix_format='\n// {0}\n'):
-                    self.wfile.write(data)
-                return
-        path = 'www' + path
-        # not found
-        if not os.path.isfile(path):
-            self.send_response(404)
-            self.send_header('Content-Type', mime('txt'))
-            self.end_headers()
-            return
-        # static
-        self.send_response(200)
-        self.send_header('Content-Type', mime(path))
-        # self.send_header('Content-Size', str(os.stat(path).st_size))
+        
+        # 404 for everything else
+        self.send_response(404)
+        self.send_header('Content-Type', 'text/plain')
         self.end_headers()
-        with open(path, 'rb') as file:
-            while True:
-                chunk = file.read(self.buffer)
-                if not self.wfile.write(chunk):
-                    break
+        self.wfile.write(b'Not Found')
         return
 
     def api_success(self, body_json=None):
@@ -451,10 +433,7 @@ class PrinterServer(HTTPServer):
         if self.handler is None:
             self.handler = self.handler_class(request, client_address, self)
             self.handler.load_config()
-            with open(os.path.join('www', 'all-scripts.txt'), 'r', encoding='utf-8') as file:
-                for path in file.read().split('\n'):
-                    if path != '':
-                        self.handler.all_script.append(os.path.join('www', path))
+            # Removed all-scripts loading
             return
         self.handler.__init__(request, client_address, self)
 
