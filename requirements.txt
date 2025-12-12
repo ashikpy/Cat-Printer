@@ -1,1 +1,3 @@
 bleak
+Pillow
+requests

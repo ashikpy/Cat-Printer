@@ -24,6 +24,12 @@ from printer import PrinterDriver, PrinterError, i18n, info
 from bleak.exc import BleakDBusError, BleakError    # pylint: disable=wrong-import-order
 
 from printer_lib.ipp import IPP
+import server_image
+import threading
+import queue
+import uuid
+import time
+import logging
 
 # Supress non-sense asyncio warnings
 warnings.simplefilter('ignore', RuntimeWarning, 0, True)
@@ -60,10 +66,91 @@ def mime(url: str):
 def concat_files(*paths, prefix_format='', buffer=4 * 1024 * 1024) -> bytes:
     'Generator, that yields buffered file content, with optional prefix'
     for path in paths:
-        yield prefix_format.format(path).encode('utf-8')
         with open(path, 'rb') as file:
             while data := file.read(buffer):
                 yield data
+
+# Job Queue Implementation
+class JobStatus:
+    QUEUED = 'queued'
+    PROCESSING = 'processing'
+    PRINTING = 'printing'
+    COMPLETED = 'completed'
+    FAILED = 'failed'
+
+class PrintJob:
+    def __init__(self, url):
+        self.id = str(uuid.uuid4())
+        self.url = url
+        self.status = JobStatus.QUEUED
+        self.created_at = time.time()
+        self.message = ""
+
+class JobProcessor(threading.Thread):
+    def __init__(self, printer_driver):
+        super().__init__(daemon=True)
+        self.queue = queue.Queue()
+        self.jobs = {} # ID -> PrintJob
+        self.printer = printer_driver
+        self.running = True
+
+    def add_job(self, url):
+        job = PrintJob(url)
+        self.jobs[job.id] = job
+        self.queue.put(job)
+        return job.id
+
+    def get_status(self, job_id):
+        job = self.jobs.get(job_id)
+        if job:
+            return {
+                "id": job.id,
+                "status": job.status,
+                "created_at": job.created_at,
+                "message": job.message
+            }
+        return None
+
+    def run(self):
+        while self.running:
+            try:
+                job = self.queue.get(timeout=1)
+                self.process_job(job)
+                self.queue.task_done()
+            except queue.Empty:
+                continue
+    
+    def process_job(self, job):
+        try:
+            job.status = JobStatus.PROCESSING
+            print(f"Processing job {job.id}: {job.url}")
+            
+            # 1. Download and Process
+            try:
+                pbm_bytes = server_image.process_image(job.url)
+            except Exception as e:
+                job.status = JobStatus.FAILED
+                job.message = f"Image processing failed: {str(e)}"
+                print(job.message)
+                return
+
+            # 2. Print
+            job.status = JobStatus.PRINTING
+            try:
+               # Use a BytesIO wrapper for the printer driver
+               pbm_io = io.BytesIO(pbm_bytes)
+               self.printer.print(pbm_io, mode='pbm')
+               job.status = JobStatus.COMPLETED
+               print(f"Job {job.id} completed")
+            except Exception as e:
+                job.status = JobStatus.FAILED
+                job.message = f"Printing failed: {str(e)}"
+                print(job.message)
+
+        except Exception as e:
+            job.status = JobStatus.FAILED
+            job.message = f"Unexpected error: {str(e)}"
+
 
 class PrinterServerHandler(BaseHTTPRequestHandler):
     '(Local) server handler for Cat Printer Web interface'
@@ -88,6 +175,9 @@ class PrinterServerHandler(BaseHTTPRequestHandler):
     all_script: list = []
 
     printer: PrinterDriver = PrinterDriver()
+    
+    # Shared processor instance (singleton for the server class)
+    job_processor = None 
 
     ipp: IPP = None
 
@@ -113,6 +203,29 @@ class PrinterServerHandler(BaseHTTPRequestHandler):
             return
         if path == '/':
             path += 'index.html'
+        
+        # New API for status
+        if path.startswith('/print_status'):
+             # Parse query
+             from urllib.parse import urlparse, parse_qs
+             query = parse_qs(urlparse(self.path).query)
+             job_id = query.get('id', [None])[0]
+             
+             if PrinterServerHandler.job_processor:
+                 status = PrinterServerHandler.job_processor.get_status(job_id)
+                 if status:
+                     self.api_success(status)
+                     return
+                 else:
+                     self.send_response(404)
+                     self.end_headers()
+                     self.wfile.write(b'Job not found')
+                     return
+             else:
+                 self.send_response(503) # Service unavailable (no processor yet)
+                 self.end_headers()
+                 return
+
         # special
         if path.startswith('/~'):
             action = path[2:]
@@ -248,6 +361,23 @@ class PrinterServerHandler(BaseHTTPRequestHandler):
         if api == 'exit':
             self.api_success()
             self.exit()
+        if api == 'print_url':
+            url = data.get('url')
+            if not url:
+                self.api_fail({'error': 'Missing url'})
+                return
+            
+            # Initialize processor if needed (lazy init ensures printer is ready)
+            if PrinterServerHandler.job_processor is None:
+                 PrinterServerHandler.job_processor = JobProcessor(self.printer)
+                 PrinterServerHandler.job_processor.start()
+
+            job_id = PrinterServerHandler.job_processor.add_job(url)
+            self.send_response(202) # Accepted
+            self.send_header('Content-Type', mime('json'))
+            self.end_headers()
+            self.wfile.write(json.dumps({'job_id': job_id, 'status': 'queued'}).encode('utf-8'))
+            return
 
     def exit(self):
         'Stop correctly & cleanly'
